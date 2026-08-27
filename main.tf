@@ -385,6 +385,85 @@ resource "aws_lambda_function" "merge_mds" {
   }
 }
 
+############
+# chunking #
+############
+
+resource "aws_iam_role" "chunking" {
+  name               = "${var.project}-chunking"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "chunking" {
+  role       = aws_iam_role.chunking.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+data "aws_iam_policy_document" "s3_read_merged_md" {
+  statement {
+    actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.main.arn}/${var.merged_md_key}"]
+  }
+}
+
+resource "aws_iam_role_policy" "s3_read_merged_md" {
+  name   = "s3-read-merged-md"
+  role   = aws_iam_role.chunking.name
+  policy = data.aws_iam_policy_document.s3_read_merged_md.json
+}
+
+variable "chunks_key" {
+  type    = string
+  default = "chunks/chunks.ljson"
+}
+
+data "aws_iam_policy_document" "s3_write_chunks" {
+  statement {
+    actions   = ["s3:PutObject"]
+    resources = ["${aws_s3_bucket.main.arn}/${var.chunks_key}"]
+  }
+}
+
+resource "aws_iam_role_policy" "s3_write_chunks" {
+  name   = "s3-write-chunks"
+  role   = aws_iam_role.chunking.name
+  policy = data.aws_iam_policy_document.s3_write_chunks.json
+}
+
+data "archive_file" "chunking" {
+  type        = "zip"
+  source_dir  = "${path.module}/lambdas/build/chunking"
+  output_path = "${path.module}/lambdas/build/chunking.zip"
+}
+
+resource "aws_lambda_function" "chunking" {
+  function_name    = "${var.project}-chunking"
+  role             = aws_iam_role.chunking.arn
+  filename         = data.archive_file.chunking.output_path
+  source_code_hash = data.archive_file.chunking.output_base64sha256
+
+  handler       = "chunking.lambda_handler"
+  runtime       = "python3.14"
+  architectures = ["arm64"]
+
+  timeout     = 100
+  memory_size = 128
+
+  environment {
+    variables = {
+      BUCKET         = aws_s3_bucket.main.id
+      IN_KEY  = var.merged_md_key
+      OUT_KEY = var.chunks_key
+    }
+  }
+
+  logging_config {
+    log_group             = aws_cloudwatch_log_group.lambdas.name
+    log_format            = "JSON"
+    application_log_level = "INFO"
+  }
+}
+
 #################
 # step function #
 #################
@@ -411,7 +490,8 @@ data "aws_iam_policy_document" "invoke_lambdas" {
       aws_lambda_function.count_pages.arn,
       aws_lambda_function.manual_pdf_to_pngs.arn,
       aws_lambda_function.png_to_md.arn,
-      aws_lambda_function.merge_mds.arn
+      aws_lambda_function.merge_mds.arn,
+      aws_lambda_function.chunking.arn
     ]
   }
 }
@@ -441,6 +521,9 @@ resource "aws_sfn_state_machine" "prepare_manual_for_rag" {
           totalPages = "{% $states.result.Payload.total_pages %}"
           modelId    = "{% $states.input.model_id %}"
           startAt    = "{% $states.input.start_at %}"
+
+          chunkSize    = "{% $states.input.chunk_size %}"
+          chunkOverlap = "{% $states.input.chunk_overlap %}"
         }
         Next = "route"
       }
@@ -459,6 +542,10 @@ resource "aws_sfn_state_machine" "prepare_manual_for_rag" {
           {
             Condition = "{% $startAt = 'merge-mds' %}"
             Next      = "merge-mds"
+          },
+          {
+            Condition = "{% $startAt = 'chunking' %}"
+            Next      = "chunking"
           },
         ]
       }
@@ -518,6 +605,20 @@ resource "aws_sfn_state_machine" "prepare_manual_for_rag" {
         Arguments = {
           FunctionName = aws_lambda_function.merge_mds.arn
           Payload      = { total_pages = "{% $totalPages %}" }
+        }
+        Output = "{% $states.result.Payload %}"
+        Next   = "chunking"
+      }
+
+      "chunking" = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::lambda:invoke"
+        Arguments = {
+          FunctionName = aws_lambda_function.chunking.arn
+          Payload = {
+            chunk_size    = "{% $chunkSize %}"
+            chunk_overlap = "{% $chunkOverlap %}"
+          }
         }
         Output = "{% $states.result.Payload %}"
         End    = true
