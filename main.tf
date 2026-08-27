@@ -261,7 +261,7 @@ data "aws_iam_policy_document" "bedrock_invoke_model" {
   }
 }
 
-resource "aws_iam_role_policy" "bedrock_invoke_model" {
+resource "aws_iam_role_policy" "png_to_md_bedrock_invoke_model" {
   name   = "bedrock-invoke-model"
   role   = aws_iam_role.png_to_md.name
   policy = data.aws_iam_policy_document.bedrock_invoke_model.json
@@ -464,6 +464,91 @@ resource "aws_lambda_function" "chunking" {
   }
 }
 
+################
+# embed chunks #
+################
+
+resource "aws_iam_role" "embed_chunks" {
+  name               = "${var.project}-embed-chunks"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "embed_chunks" {
+  role       = aws_iam_role.embed_chunks.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+data "aws_iam_policy_document" "s3_read_chunks" {
+  statement {
+    actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.main.arn}/${var.chunks_key}"]
+  }
+}
+
+resource "aws_iam_role_policy" "s3_read_chunks" {
+  name   = "s3-read-chunks"
+  role   = aws_iam_role.embed_chunks.name
+  policy = data.aws_iam_policy_document.s3_read_chunks.json
+}
+
+variable "embeddings_key" {
+  type    = string
+  default = "embeddings/embeddings.ljson"
+}
+
+data "aws_iam_policy_document" "s3_write_embeddings" {
+  statement {
+    actions   = ["s3:PutObject"]
+    resources = ["${aws_s3_bucket.main.arn}/${var.embeddings_key}"]
+  }
+}
+
+resource "aws_iam_role_policy" "s3_write_embeddings" {
+  name   = "s3-write-embeddings"
+  role   = aws_iam_role.embed_chunks.name
+  policy = data.aws_iam_policy_document.s3_write_embeddings.json
+}
+
+resource "aws_iam_role_policy" "embed_chunks_bedrock_invoke_model" {
+  name   = "bedrock-invoke-model"
+  role   = aws_iam_role.embed_chunks.name
+  policy = data.aws_iam_policy_document.bedrock_invoke_model.json
+}
+
+data "archive_file" "embed_chunks" {
+  type        = "zip"
+  source_dir  = "${path.module}/lambdas/build/embed_chunks"
+  output_path = "${path.module}/lambdas/build/embed_chunks.zip"
+}
+
+resource "aws_lambda_function" "embed_chunks" {
+  function_name    = "${var.project}-embed-chunks"
+  role             = aws_iam_role.embed_chunks.arn
+  filename         = data.archive_file.embed_chunks.output_path
+  source_code_hash = data.archive_file.embed_chunks.output_base64sha256
+
+  handler       = "embed_chunks.lambda_handler"
+  runtime       = "python3.14"
+  architectures = ["arm64"]
+
+  timeout     = 100
+  memory_size = 128
+
+  environment {
+    variables = {
+      BUCKET         = aws_s3_bucket.main.id
+      IN_KEY  = var.chunks_key
+      OUT_KEY = var.embeddings_key
+    }
+  }
+
+  logging_config {
+    log_group             = aws_cloudwatch_log_group.lambdas.name
+    log_format            = "JSON"
+    application_log_level = "INFO"
+  }
+}
+
 #################
 # step function #
 #################
@@ -491,7 +576,8 @@ data "aws_iam_policy_document" "invoke_lambdas" {
       aws_lambda_function.manual_pdf_to_pngs.arn,
       aws_lambda_function.png_to_md.arn,
       aws_lambda_function.merge_mds.arn,
-      aws_lambda_function.chunking.arn
+      aws_lambda_function.chunking.arn,
+      aws_lambda_function.embed_chunks.arn
     ]
   }
 }
@@ -546,6 +632,10 @@ resource "aws_sfn_state_machine" "prepare_manual_for_rag" {
           {
             Condition = "{% $startAt = 'chunking' %}"
             Next      = "chunking"
+          },
+          {
+            Condition = "{% $startAt = 'embed-chunks' %}"
+            Next      = "embed-chunks"
           },
         ]
       }
@@ -619,6 +709,16 @@ resource "aws_sfn_state_machine" "prepare_manual_for_rag" {
             chunk_size    = "{% $chunkSize %}"
             chunk_overlap = "{% $chunkOverlap %}"
           }
+        }
+        Output = "{% $states.result.Payload %}"
+        Next   = "embed-chunks"
+      }
+
+      "embed-chunks" = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::lambda:invoke"
+        Arguments = {
+          FunctionName = aws_lambda_function.embed_chunks.arn
         }
         Output = "{% $states.result.Payload %}"
         End    = true

@@ -4,7 +4,7 @@ set -euo pipefail
 MODEL_ID="eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
 CHUNK_SIZE=1000
 CHUNK_OVERLAP=150
-START_AT="chunking"
+START_AT="embed-chunks"
 
 STATE_MACHINE_ARN=$(terraform output -raw state_machine_arn)
 
