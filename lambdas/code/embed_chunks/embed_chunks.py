@@ -5,10 +5,6 @@ import boto3
 s3 = boto3.client("s3")
 bedrock = boto3.client("bedrock-runtime")
 
-BUCKET = os.environ["BUCKET"]
-IN_KEY = os.environ["IN_KEY"]
-OUT_KEY = os.environ["OUT_KEY"]
-
 MODEL_ID = "amazon.titan-embed-text-v2:0"
 DIMENSIONS = 1024
 
@@ -25,18 +21,28 @@ def embed(text):
     return json.loads(resp["body"].read())["embedding"]
 
 
-def lambda_handler(event, context):
-    raw = s3.get_object(
-        Bucket=BUCKET, Key=IN_KEY)["Body"].read().decode("utf-8")
+def embed_all(raw):
+    """Take chunks as json lines, return them with their embedding added."""
     chunks = [json.loads(l) for l in raw.splitlines() if l.strip()]
 
     for chunk in chunks:
         chunk["embedding"] = embed(chunk["text"])
 
-    body = "\n".join(json.dumps(c, ensure_ascii=False) for c in chunks) + "\n"
-    s3.put_object(Bucket=BUCKET, Key=OUT_KEY,
+    return "\n".join(json.dumps(c, ensure_ascii=False) for c in chunks) + "\n"
+
+
+def lambda_handler(event, context):
+    bucket = os.environ["BUCKET"]
+    in_key = os.environ["IN_KEY"]
+    out_key = os.environ["OUT_KEY"]
+
+    raw = s3.get_object(
+        Bucket=bucket, Key=in_key)["Body"].read().decode("utf-8")
+
+    body = embed_all(raw)
+
+    s3.put_object(Bucket=bucket, Key=out_key,
                   Body=body.encode("utf-8"),
                   ContentType="application/x-ndjson")
 
-    return {"ok": True, "out_key": OUT_KEY, "chunks": len(chunks),
-            "dimensions": len(chunks[0]["embedding"]) if chunks else 0}
+    return {"ok": True, "out_key": out_key, "dimensions": DIMENSIONS}

@@ -4,7 +4,7 @@ set -euo pipefail
 rm -rf lambdas/build/chunking
 mkdir -p lambdas/build/chunking
 
-cp lambdas/code/chunking/*.py lambdas/build/chunking/
+cp lambdas/code/chunking/chunking.py lambdas/build/chunking/
 
 pip install \
   --platform manylinux2014_aarch64 \

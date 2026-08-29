@@ -7,11 +7,6 @@ import boto3
 s3 = boto3.client("s3")
 bedrock = boto3.client("bedrock-runtime")
 
-BUCKET = os.environ["BUCKET"]
-TOKEN = os.environ["TELEGRAM_TOKEN"]
-SECRET = os.environ["WEBHOOK_SECRET"]
-IN_KEY = os.environ["IN_KEY"]
-
 EMBED_MODEL = "amazon.titan-embed-text-v2:0"
 CHAT_MODEL = "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
 TOP_K = 5
@@ -19,13 +14,8 @@ TOP_K = 5
 _cache = {}
 
 
-def load_chunks():
-    """Load and cache the embedded chunks between warm invocations."""
-    if "data" not in _cache:
-        raw = s3.get_object(
-            Bucket=BUCKET, Key=IN_KEY)["Body"].read().decode("utf-8")
-        _cache["data"] = [json.loads(l) for l in raw.splitlines() if l.strip()]
-    return _cache["data"]
+def load_chunks(raw):
+    return [json.loads(l) for l in raw.splitlines() if l.strip()]
 
 
 def embed(text):
@@ -37,11 +27,11 @@ def embed(text):
     return json.loads(resp["body"].read())["embedding"]
 
 
-def search(query, k=TOP_K):
+def search(query, chunks, k=TOP_K):
     """Vectors are normalized, so the dot product is the cosine similarity."""
     q = embed(query)
     return sorted(
-        load_chunks(),
+        chunks,
         key=lambda c: sum(a * b for a, b in zip(q, c["embedding"])),
         reverse=True,
     )[:k]
@@ -70,18 +60,22 @@ def answer(query, hits):
     return "".join(b["text"] for b in result["content"] if b["type"] == "text")
 
 
-def send(chat_id, text):
-    req = urllib.request.Request(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        data=json.dumps({"chat_id": chat_id, "text": text}).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    urllib.request.urlopen(req, timeout=10)
-
-
 def lambda_handler(event, context):
+    bucket = os.environ["BUCKET"]
+    in_key = os.environ["IN_KEY"]
+    token = os.environ["TELEGRAM_TOKEN"]
+    secret = os.environ["WEBHOOK_SECRET"]
+
+    def send(chat_id, text):
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=json.dumps({"chat_id": chat_id, "text": text}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=10)
+
     headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
-    if headers.get("x-telegram-bot-api-secret-token") != SECRET:
+    if headers.get("x-telegram-bot-api-secret-token") != secret:
         return {"statusCode": 403, "body": "forbidden"}
 
     update = json.loads(event.get("body") or "{}")
@@ -92,9 +86,15 @@ def lambda_handler(event, context):
     if not text or not chat_id:
         return {"statusCode": 200, "body": "ok"}
 
+    # Cache the embedded chunks between warm invocations.
+    if "data" not in _cache:
+        raw = s3.get_object(
+            Bucket=bucket, Key=in_key)["Body"].read().decode("utf-8")
+        _cache["data"] = load_chunks(raw)
+
     # Always return 200 - otherwise Telegram retries and we process twice.
     try:
-        send(chat_id, answer(text, search(text)))
+        send(chat_id, answer(text, search(text, _cache["data"])))
     except Exception:
         traceback.print_exc()
         try:

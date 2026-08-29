@@ -27,3 +27,6 @@ override_*.tf
 data
 
 lambdas/build
+.venv
+
+__pycache__
